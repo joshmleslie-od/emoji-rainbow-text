@@ -257,12 +257,12 @@
           <label style="font-weight: bold; font-size: 14px">Output Format</label>
           <div style="display: flex; gap: 15px">
             <label style="display: flex; align-items: center; gap: 5px; cursor: pointer">
-              <input type="radio" name="format" value="apng" checked />
-              APNG
+              <input type="radio" name="format" value="gif" checked />
+              GIF
             </label>
             <label style="display: flex; align-items: center; gap: 5px; cursor: pointer">
-              <input type="radio" name="format" value="gif" />
-              GIF
+              <input type="radio" name="format" value="apng" />
+              APNG
             </label>
           </div>
           <div style="font-size: 11px; color: #888">
@@ -276,13 +276,14 @@
       </div>
 
       <div class="controls">
-        <button id="downloadBtn">Download as <span id="formatType">APNG</span></button>
+        <button id="downloadBtn">Download as <span id="formatType">GIF</span></button>
       </div>
 
       <div class="status" id="status"></div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/rgbquant@1.1.2/src/rgbquant.js"></script>
+    <script src="https://unpkg.com/omggif@1.0.10/omggif.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/upng-js@2.1.0/UPNG.js"></script>
     <script>
@@ -408,24 +409,6 @@
         });
       });
 
-      let workerBlobUrl = null;
-
-      async function getWorkerUrl() {
-        if (workerBlobUrl) return workerBlobUrl;
-
-        try {
-          const response = await fetch(
-            "https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.worker.js"
-          );
-          const blob = await response.blob();
-          workerBlobUrl = URL.createObjectURL(blob);
-          return workerBlobUrl;
-        } catch (e) {
-          console.error("Failed to load worker:", e);
-          return null;
-        }
-      }
-
       downloadBtn.addEventListener("click", async () => {
         const text = textInput.value || "ultrathink";
         const format = document.querySelector('input[name="format"]:checked').value;
@@ -445,64 +428,93 @@
       });
 
       async function generateGIF(text) {
-        status.textContent = "Loading...";
-
-        // Get worker URL
-        const workerUrl = await getWorkerUrl();
-        if (!workerUrl) {
-          status.textContent = "Failed to load GIF encoder";
-          downloadBtn.disabled = false;
-          return;
-        }
-
         status.textContent = "Generating GIF...";
 
-        // Create GIF
-        const gif = new GIF({
-          workers: 2,
-          quality: 1, // Lower = better quality, less quantization artifacts
-          width: canvas.width,
-          height: canvas.height,
-          workerScript: workerUrl,
-          background: "#1a1a1a",
-          transparent: null,
-          globalPalette: true, // Use single palette for all frames to prevent color shifting
-        });
-
-        // Capture frames
+        // Step 1: Capture all frames as ImageData
+        const frames = [];
         for (let i = 0; i < TOTAL_FRAMES; i++) {
           drawText(text, i);
-          gif.addFrame(canvas, {
-            delay: FRAME_DELAY,
-            copy: true,
-            dispose: 1, // Do not dispose - leave frame in place
-          });
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          frames.push(imageData);
           status.textContent = `Capturing frames... ${i + 1}/${TOTAL_FRAMES}`;
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
 
-        status.textContent = "Rendering GIF...";
+        status.textContent = "Building color palette...";
+        await new Promise((resolve) => setTimeout(resolve, 10));
 
-        gif.on("finished", (blob) => {
-          // Download the GIF
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `${text.replace(/\s+/g, "-")}-rainbow.gif`;
-          a.click();
-          URL.revokeObjectURL(url);
-
-          downloadBtn.disabled = false;
-          status.textContent = "Download complete!";
-          setTimeout(() => {
-            status.textContent = "";
-          }, 3000);
-
-          // Resume animation
-          startAnimation();
+        // Step 2: Build optimal palette using RgbQuant
+        const quantizer = new RgbQuant({
+          colors: 256,
+          minHueCols: 256, // Critical: Preserve all hues for rainbow gradients!
+          dithKern: 'FloydSteinberg',
+          dithSerp: true
         });
 
-        gif.render();
+        // Sample all frames to build palette (pass ImageData directly)
+        frames.forEach(imageData => {
+          quantizer.sample(imageData);
+        });
+
+        status.textContent = "Quantizing frames...";
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Get palette as RGB triplets
+        const rgbPalette = quantizer.palette(true); // Returns [[r,g,b], [r,g,b], ...]
+
+        // Convert palette to omggif format: (r << 16) | (g << 8) | b
+        const omggifPalette = rgbPalette.map(rgb =>
+          (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
+        );
+
+        // Reduce each frame to indexed colors
+        const indexedFrames = frames.map((imageData, i) => {
+          status.textContent = `Quantizing frame ${i + 1}/${TOTAL_FRAMES}`;
+          return quantizer.reduce(imageData, 2); // 2 = indexed array
+        });
+
+        status.textContent = "Encoding GIF...";
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Step 3: Encode with omggif
+        // Calculate buffer size (rough estimate: width * height * frames + palette)
+        const bufferSize = canvas.width * canvas.height * TOTAL_FRAMES + omggifPalette.length * 4 + 10240;
+        const buffer = new Uint8Array(bufferSize);
+
+        const gifWriter = new GifWriter(buffer, canvas.width, canvas.height, {
+          palette: omggifPalette,
+          loop: 0 // Infinite loop
+        });
+
+        // Add each frame
+        indexedFrames.forEach((indexed, i) => {
+          gifWriter.addFrame(0, 0, canvas.width, canvas.height, indexed, {
+            delay: Math.round(FRAME_DELAY / 10), // omggif uses centiseconds (1/100s)
+            disposal: 1 // Leave frame in place
+          });
+          status.textContent = `Encoding frame ${i + 1}/${TOTAL_FRAMES}`;
+        });
+
+        // Get final GIF data
+        const gifData = buffer.subarray(0, gifWriter.end());
+        const blob = new Blob([gifData], { type: "image/gif" });
+
+        // Download the GIF
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${text.replace(/\s+/g, "-")}-rainbow.gif`;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        downloadBtn.disabled = false;
+        status.textContent = "Download complete!";
+        setTimeout(() => {
+          status.textContent = "";
+        }, 3000);
+
+        // Resume animation
+        startAnimation();
       }
 
       async function generateAPNG(text) {
